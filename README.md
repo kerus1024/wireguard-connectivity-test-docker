@@ -72,7 +72,7 @@ sudo docker run --rm --cap-add=NET_ADMIN --device=/dev/net/tun \
   -e RUN_TIMEOUT=30 \
   -e HEALTH_CHECK_ENDPOINT=8.8.8.8 \
   -e WG_CONFIG_DATA=W0ludGVyZmFjZV0KQWRkcmVzcyA9IDE3Mi4zMS4wLjIKRE5TID0gMS4xLjEuMSwxLjAuMC4xClByaXZhdGVLZXkgPSBEOVE4dDN5S3VqQmVGTU1yaUFoanI0SFdGcFUrdUNLdGhtbFBvcTVRenlVPQoKW1BlZXJdCkFsbG93ZWRJUHMgPSAwLjAuMC4wLzAKRW5kcG9pbnQgPSAxNjIuMTU5LjE5Mi4xOjIwNDgKUHVibGljS2V5ID0gN0QwVmZqOWxQUWg4a2dPdWZ0UHlmWkhKb2RHS0ZPNWs3UXBLWUY2Y0J3ND0= \
-  wireguard-connectivity-test-docker:1
+  ghcr.io/kerus1024/wireguard-connectivity-test-docker:1
 ```
 
 #### Sample of kubernetes pod
