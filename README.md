@@ -2,7 +2,7 @@
 
 컨테이너를 생성하여 Wireguard 프로필의 도달성을 확인합니다.Verify the reachability of the Wireguard profile by creating a container.
 
-이것은 Userspace 구현체인 [wireguard-go](https://github.com/Wireuard/wireguard-go) 클라이언트를 사용하여 커널 모듈 활성화가 필요없이 다양한 배포판에서 구동할 수 있습니다. 그러나 여전히 구동 환경은 네트워크를 망치므로 리눅스 격리 플랫폼이 필요합니다. 도커 컨테이너 이미지 기반으로 만들어졌습니다.It can be run on a variety of distributions without the need for kernel module activation using the wireguard-go client, a userspace implementation. However, the operating environment still ruins the network, so a Linux isolation platform is needed. It is built based on Docker container image.
+이것은 Userspace 구현체인 [wireguard-go](https://github.com/wireguard/wireguard-go) 클라이언트를 사용하여 커널 모듈 활성화가 필요없이 다양한 배포판에서 구동할 수 있습니다. 그러나 여전히 구동 환경은 네트워크를 망치므로 리눅스 격리 플랫폼이 필요합니다. 도커 컨테이너 이미지 기반으로 만들어졌습니다.It can be run on a variety of distributions without the need for kernel module activation using the wireguard-go client, a userspace implementation. However, the operating environment still ruins the network, so a Linux isolation platform is needed. It is built based on Docker container image.
 
 
 ## Concepts
@@ -42,7 +42,7 @@ When the container image is started, user settings are made through environment 
 
 ### List of Environment variables
 
-- `WG_CONFIG_DATA`: wg-quick 유틸리티에서 사용하는 Wireguard Configuration파일(wg0.conf)을 Base64로 Encoding한 것 입니다.
+- `WG_CONFIG_DATA`: wg-quick 유틸리티에서 사용하는 Wireguard Configuration파일(`wg0.conf`)을 Base64로 Encoding한 것 입니다.
   - ⚠️테스트시 사용할 Config는 별도의 실제 사용자가 있는 Peer Configuration이 되는 경우 **실제 사용자의 연결에 충돌이 발생합니다**. 테스트 전용의 Peer를 생성하여 연결성 테스트를 하세요.
 - `HEALTH_CHECK_METHOD`= (Default) `icmp`
   - `icmp`: `HEALTH_CHECK_ENDPOINT`에 보낸 icmp echo-request에 대한 reply을 받을 수 있는 경우 테스트는 성공합니다. 손실율에 관해서는 상관하지 않습니다.
@@ -125,3 +125,4 @@ cronjob:
 ###### Test Callback
 ###### check container uid
 ###### lightweighting
+###### prometehus export

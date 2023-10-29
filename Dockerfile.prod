@@ -20,14 +20,29 @@ COPY --from=wireguardgo /wgbuild/wireguard-go /bin/wireguard-go
 
 WORKDIR /app
 COPY go.mod go.sum /app
-RUN apk --no-cache --update add libcap iptables tcpdump iproute2 && go mod download
 COPY *.go /app
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o /wireguard-connectivity-test && \
+RUN apk --no-cache --update add libcap iptables tcpdump iproute2 && go mod download && \
+    CGO_ENABLED=0 GOOS=linux go build -o /wireguard-connectivity-test && \
     setcap cap_net_raw=+ep /wireguard-connectivity-test && \
     rm -rf ~/.cache && \
     rm -rf /go
 
 USER 0:0
 
+
+# Lightweighting for prod
+FROM gcr.io/distroless/static:latest as prod
+
+WORKDIR /app
+
+COPY --from=wireguardgo /lib/ld-musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1
+COPY --from=wireguardgo /wgbuild/wireguard-go /bin/wireguard-go
+
+COPY --from=tester /usr/lib /usr/lib
+COPY --from=tester /lib /lib
+COPY --from=tester /sbin /sbin
+COPY --from=tester /wireguard-connectivity-test /wireguard-connectivity-test
+
+USER 0:0
 CMD ["/wireguard-connectivity-test"]
