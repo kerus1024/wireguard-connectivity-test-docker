@@ -91,7 +91,8 @@ func printSuccessWithMessage(s string) {
 		j.Label = ConfigEnv.label
 	}
 
-	u, err := json.MarshalIndent(j, "", "    ")
+	//u, err := json.MarshalIndent(j, "", "    ")
+	u, err := json.Marshal(j)
 	if err != nil {
 		printErrorWithMessage(err)
 	}
@@ -118,7 +119,8 @@ func printErrorWithMessage(err error) {
 		j.Label = ConfigEnv.label
 	}
 
-	u, err := json.MarshalIndent(j, "", "    ")
+	//u, err := json.MarshalIndent(j, "", "    ")
+	u, err := json.Marshal(j)
 	if err != nil {
 		printErrorWithMessage(err)
 	}

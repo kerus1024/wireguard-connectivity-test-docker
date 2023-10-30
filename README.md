@@ -20,19 +20,13 @@
 
 🟢Exit code status with `0` if test is successful
 ```
-{
-    "result": "ok",
-    "message": "32 bytes from 1.1.1.1: icmp_seq=0 time=22.844702ms\n"
-}
+{"result": "ok","message": "32 bytes from 1.1.1.1: icmp_seq=0 time=22.844702ms\n"}
 ```
 
 ❌Exit code status with `1` if test fails
 
 ```
-{
-    "result": "error",
-    "message": "something is wrong"
-}
+{"result": "error","message": "something is wrong"}
 ```
 
 ## How to use
