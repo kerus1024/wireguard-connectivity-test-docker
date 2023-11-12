@@ -11,10 +11,12 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,20 +25,33 @@ import (
 )
 
 const (
-	DEBUG_SHOW_WIREGUARD_MESSAGE  = 1 << 1
-	DEBUG_SHOW_DEBUG_MESSAGE      = 1 << 2
-	DEBUG_SHOW_STATISTICS_MESSAGE = 1 << 3
+	DEBUG_SHOW_ERROR_MESSAGE    = 1 << 1
+	DEBUG_SHOW_CRITICAL_MESSAGE = 1 << 2
+	DEBUG_SHOW_INFO_MESSAGE     = 1 << 3
+	DEBUG_SHOW_DEBUG_MESSAGE    = 1 << 4
+	DEBUG_SHOW_CHAOS_MESSAGE    = 1 << 7
+
+	DEBUG_SHOW_WIREGUARD_MESSAGE  = 1 << 10
+	DEBUG_SHOW_STATISTICS_MESSAGE = 1 << 11
+	DEBUG_DO_NOT_STOP             = 1 << 31 // 4294967295
 )
 
 // var DebugLevel = DEBUG_SHOW_WIREGUARD_MESSAGE + DEBUG_SHOW_DEBUG_MESSAGE + DEBUG_SHOW_STATISTICS_MESSAGE
-var DebugLevel = DEBUG_SHOW_DEBUG_MESSAGE + DEBUG_SHOW_STATISTICS_MESSAGE
+var DebugLevel int // DEBUG_LEVEL
 
 var WireguardInterfacePrefix string = "wg_" // /var/run/wireguard/%s.sock"
+var WireguardProfileFilePath = "/profile.json"
+var WireguardProfileDirectoryPath = "/etc/wireguard"
 
 type ResultMessage struct {
-	Status  string          `json:"status"`
-	Message string          `json:"message"`
-	Results json.RawMessage `json:"results"`
+	Status                    string          `json:"status"`
+	Message                   string          `json:"message"`
+	DesiredCheckCount         int             `json:"total"`
+	ProceedCount              int             `json:"proceed"`
+	ErrorCount                int             `json:"proceederror"`
+	SucceedCount              int             `json:"succeed"`
+	ActiveParallelWorkerCount int             `json:"workers"`
+	Results                   json.RawMessage `json:"results"`
 }
 
 type JobResultMessage struct {
@@ -47,7 +62,7 @@ type JobResultMessage struct {
 
 func debugMessage(logLevel int, s string) {
 
-	if DebugLevel&logLevel == 0 {
+	if DebugLevel&logLevel != logLevel {
 		return
 	}
 
@@ -59,14 +74,16 @@ func debugMessage(logLevel int, s string) {
 }
 
 var AppConfig struct {
-	HealthCheckMethod     string
-	HealthCheckEndpoint   string
-	HealthCheckRetries    int
-	HealthCheckInterval   time.Duration
-	HealthCheckTimeout    time.Duration // Fixed in dns(2000ms) icmp(800ms)
-	HealthCheckRunTimeout time.Duration
-	RunTimeout            time.Duration
-	WorkerCount           int
+	HealthCheckMethod         string        // HEALTHCHECK_METHOD
+	HealthCheckEndpoint       string        // HEALTHCHECK_ENDPOINT
+	HealthCheckTimeout        time.Duration // HEALTHCHECK_TIMEOUT -- Fixed in dns(2000ms) icmp(800ms)
+	HealthCheckInterval       time.Duration // HEALTHCHECK_INTERVAL
+	HealthCheckRetries        int           // HEALTHCHECK_RETRIES
+	HealthCheckRunTimeout     time.Duration // HEALTHCHECK_RUNTIMEOUT
+	RunTimeout                time.Duration // RUNTIMEOUT
+	WorkerCount               int           // WORKER
+	RemoteProfilePath         string        // REMOTE_PROFILE_PATH
+	ActiveParallelWorkerCount int
 }
 
 var WireguardWorkersJob map[int]WireguardJobList // key=worker num
@@ -80,10 +97,11 @@ type WireguardQuickConf struct {
 	ProfileID       string // Not standrard
 	ProfileSequence int
 	Interface       struct {
-		Address    string
-		DNS        string
-		DNSs       []string
-		PrivateKey string
+		Address           string
+		AddressCIDRPrefix uint8
+		DNS               string
+		DNSs              []string
+		PrivateKey        string
 	}
 	Peer struct {
 		AllowedIPs   string
@@ -97,8 +115,9 @@ type WireguardQuickConf struct {
 }
 
 type JobResult struct {
-	ProfileID string
-	Error     error
+	ProfileID      string
+	SuccessMessage string
+	Error          error
 }
 
 type ErrorSuccessResult struct {
@@ -113,23 +132,86 @@ var defaultGatewayAddress string
 func loadProfile() (WireguardProfileList, error) {
 
 	profileList := make(WireguardProfileList)
+	var rawList WireguardProfileListRaw
 
-	data, err := ioutil.ReadFile("./profile.json")
-	if err != nil {
-		return nil, err
+	if AppConfig.RemoteProfilePath != "" {
+
+		debugMessage(DEBUG_SHOW_INFO_MESSAGE, fmt.Sprintf("Get profile from %s", AppConfig.RemoteProfilePath))
+
+		resp, err := http.Get(AppConfig.RemoteProfilePath)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return nil, errors.New("the response of profile request has not returned 200")
+		}
+
+		err = json.NewDecoder(resp.Body).Decode(&rawList)
+		if err != nil {
+			return nil, err
+		}
+
+	} else {
+
+		debugMessage(DEBUG_SHOW_INFO_MESSAGE, fmt.Sprintf("Try read from %s", WireguardProfileFilePath))
+		data, err := ioutil.ReadFile(WireguardProfileFilePath)
+		if err == nil {
+
+			err = json.Unmarshal(data, &rawList)
+			if err != nil {
+				return nil, err
+			}
+
+			debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, string(data))
+
+		} else {
+
+			rawList = make(WireguardProfileListRaw)
+
+			debugMessage(DEBUG_SHOW_INFO_MESSAGE, fmt.Sprintf("Try read from %s", WireguardProfileDirectoryPath))
+			readdir, err := ioutil.ReadDir(WireguardProfileDirectoryPath)
+			if err != nil {
+				debugMessage(DEBUG_SHOW_INFO_MESSAGE, fmt.Sprintf("Cannot read %s // %s", WireguardProfileFilePath, err.Error()))
+				return nil, err
+			}
+
+			for _, file := range readdir {
+
+				if !file.IsDir() && strings.HasSuffix(file.Name(), ".conf") {
+					profileId := strings.TrimSuffix(file.Name(), ".conf")
+					if profileId == "" {
+						return nil, errors.New("read .conf")
+					}
+
+					readData, err := ioutil.ReadFile(file.Name())
+					if err != nil {
+						debugMessage(DEBUG_SHOW_INFO_MESSAGE, fmt.Sprintf("Cannot read %s // %s", file.Name(), err.Error()))
+						continue
+					}
+
+					rawList[profileId] = base64.StdEncoding.EncodeToString(readData)
+
+				}
+
+			}
+
+			return nil, err
+		}
+
 	}
 
-	debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, string(data))
-
-	var rawList WireguardProfileListRaw
-	err = json.Unmarshal(data, &rawList)
-	if err != nil {
-		return nil, err
+	if len(rawList) == 0 {
+		return nil, errors.New("did not read any profile")
 	}
 
 	seq := 1
 
 	for profileId, base64EncodedWireguardQuickProfile := range rawList {
+
+		if len(profileId)+len(WireguardInterfacePrefix) > 15 {
+			panic(fmt.Sprintf("ifname [%s%s] is too long", profileId, WireguardInterfacePrefix))
+		}
 
 		decodeArray, err := base64.StdEncoding.DecodeString(base64EncodedWireguardQuickProfile)
 		if err != nil {
@@ -150,13 +232,26 @@ func loadProfile() (WireguardProfileList, error) {
 		var wgQuickConf WireguardQuickConf
 		wgQuickConf.ProfileID = profileId
 		wgQuickConf.ProfileSequence = seq
-		wgQuickConf.Interface.Address = cfg.Section("Interface").Key("Address").String()
+		profileIPAddress := cfg.Section("Interface").Key("Address").String()
+
+		netIP, _, err := net.ParseCIDR(profileIPAddress)
+		if err == nil {
+			wgQuickConf.Interface.Address = netIP.String()
+		} else {
+			if netIP := net.ParseIP(profileIPAddress); netIP != nil {
+				wgQuickConf.Interface.Address = netIP.String()
+			} else {
+				panic(fmt.Sprintf("Profile [%s] IP address [%s] is invalid", profileId, profileIPAddress))
+			}
+		}
+
 		wgQuickConf.Interface.DNS = cfg.Section("Interface").Key("DNS").String()
 
 		wgQuickConf.Interface.DNSs = strings.Split(wgQuickConf.Interface.DNS, ",")
 		for i := range wgQuickConf.Interface.DNSs {
 			wgQuickConf.Interface.DNSs[i] = strings.TrimSpace(wgQuickConf.Interface.DNSs[i])
 		}
+		wgQuickConf.Interface.DNS = wgQuickConf.Interface.DNSs[0]
 
 		wgQuickConf.Interface.PrivateKey, err = convertWireguardQuickConfigurationKeyHexEncoding(cfg.Section("Interface").Key("PrivateKey").String())
 		if err != nil {
@@ -165,6 +260,11 @@ func loadProfile() (WireguardProfileList, error) {
 
 		wgQuickConf.Peer.AllowedIPs = cfg.Section("Peer").Key("AllowedIPs").String()
 		// TODO: AllowedIPs no defualt route
+		wgQuickConf.Peer.AllowedIPss = strings.Split(wgQuickConf.Peer.AllowedIPs, ",")
+		for i := range wgQuickConf.Peer.AllowedIPss {
+			wgQuickConf.Peer.AllowedIPss[i] = strings.TrimSpace(wgQuickConf.Peer.AllowedIPss[i])
+		}
+		wgQuickConf.Peer.AllowedIPs = wgQuickConf.Peer.AllowedIPss[0]
 
 		wgQuickConf.Peer.Endpoint = cfg.Section("Peer").Key("Endpoint").String()
 
@@ -301,6 +401,7 @@ func startWorker(processCh chan JobResult, wireguardProfileList WireguardProfile
 
 		debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, fmt.Sprintf("Start Worker #%d", workerNum))
 		wg.Add(1)
+		AppConfig.ActiveParallelWorkerCount++
 		go workerRun(wg, workerNum, processCh, workerJobList)
 
 	}
@@ -322,6 +423,10 @@ func workerRun(wg *sync.WaitGroup, workerNum int, processCh chan JobResult, wgJo
 			var rtId int
 
 			pid, err := wireguard(i, workerNum, subJob, &rtId)
+			if DebugLevel&DEBUG_DO_NOT_STOP == DEBUG_DO_NOT_STOP {
+				continue
+			}
+
 			if err != nil {
 				proc, errProcess := os.FindProcess(pid)
 				if errProcess == nil {
@@ -339,9 +444,9 @@ func workerRun(wg *sync.WaitGroup, workerNum int, processCh chan JobResult, wgJo
 				continue
 			}
 
-			err = healthCheck(i, workerNum, subJob)
-			if err != nil {
-				debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, err.Error())
+			hr := healthCheck(i, workerNum, subJob)
+			if hr.Error != nil {
+				debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, hr.Error.Error())
 			}
 
 			proc, errProcess := os.FindProcess(pid)
@@ -353,13 +458,16 @@ func workerRun(wg *sync.WaitGroup, workerNum int, processCh chan JobResult, wgJo
 			cleanWireguard(i, workerNum, subJob, &rtId)
 
 			processCh <- JobResult{
-				ProfileID: subJob.Profile.ProfileID,
-				Error:     err,
+				ProfileID:      subJob.Profile.ProfileID,
+				SuccessMessage: hr.SuccessMessage,
+				Error:          hr.Error,
 			}
 
 		}
 
 	}
+
+	debugMessage(DEBUG_SHOW_INFO_MESSAGE, fmt.Sprintf("Worker#%d has done", workerNum))
 
 }
 
@@ -390,18 +498,12 @@ func wireguard(subJobSequence int, workerNum int, wgJob WireguardJob, routerTabl
 			flag := false
 
 			if scanOut {
-				if DebugLevel&DEBUG_SHOW_WIREGUARD_MESSAGE != 0 {
-					debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, stdoutScanner.Text())
-				}
+				debugMessage(DEBUG_SHOW_WIREGUARD_MESSAGE, stdoutScanner.Text())
 				flag = true
-
 			}
 
 			if scanErr {
-				if DebugLevel&DEBUG_SHOW_WIREGUARD_MESSAGE != 0 {
-
-					debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, stderrScanner.Text())
-				}
+				debugMessage(DEBUG_SHOW_WIREGUARD_MESSAGE, stderrScanner.Text())
 				flag = true
 			}
 
@@ -503,18 +605,18 @@ func wireguard(subJobSequence int, workerNum int, wgJob WireguardJob, routerTabl
 	// Tunnel Setup
 
 	var intSetupCommand []string
-	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip addr add %s dev %s", wgJob.Profile.Interface.Address, wireguardInterfaceName))
+	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip addr add %s/32 dev %s", wgJob.Profile.Interface.Address, wireguardInterfaceName))
 	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip link set %s up", wireguardInterfaceName))
 
 	if subJobSequence == 0 {
-		intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip route add %s via %s metric 1", wgJob.Profile.Peer.EndpointIP, defaultGatewayAddress))
+		intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip route add %s/32 via %s metric 1", wgJob.Profile.Peer.EndpointIP, defaultGatewayAddress))
 		// intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip route add %s via %s metric 1", wgJob.Profile.Peer.EndpointIP, defaultGatewayAddress))
 	}
 
 	*routerTableId = (wgJob.Profile.ProfileSequence + 1000)
 
 	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip route add default via %s dev %s table %d", wgJob.Profile.Interface.Address, wireguardInterfaceName, (*routerTableId)))
-	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip rule add from %s table %d", wgJob.Profile.Interface.Address, (*routerTableId)))
+	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip rule add from %s/32 table %d", wgJob.Profile.Interface.Address, (*routerTableId)))
 
 	for _, command := range intSetupCommand {
 
@@ -554,12 +656,14 @@ func cleanWireguard(subJobSequence int, workerNum int, wgJob WireguardJob, route
 
 	wireguardInterfaceName := fmt.Sprintf("%s%s", WireguardInterfacePrefix, wgJob.Profile.ProfileID)
 
-	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip addr delete %s dev %s", wgJob.Profile.Interface.Address, wireguardInterfaceName))
+	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip addr delete %s/32 dev %s", wgJob.Profile.Interface.Address, wireguardInterfaceName))
 	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip link delete %s", wireguardInterfaceName))
+
+	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip route add %s/32 via %s metric 1", wgJob.Profile.Peer.EndpointIP, defaultGatewayAddress))
 
 	if routerTableId != nil {
 		intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip route delete default via %s dev %s table %d", wgJob.Profile.Interface.Address, wireguardInterfaceName, (*routerTableId)))
-		intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip rule delete from %s table %d", wgJob.Profile.Interface.Address, (*routerTableId)))
+		intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip rule delete from %s/32 table %d", wgJob.Profile.Interface.Address, (*routerTableId)))
 	}
 
 	for _, command := range intSetupCommand {
@@ -575,15 +679,15 @@ func cleanWireguard(subJobSequence int, workerNum int, wgJob WireguardJob, route
 		cmd.Stdout = &outb
 		cmd.Stderr = &errb
 		if err := cmd.Run(); err != nil {
-			debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, fmt.Sprintf("[ERROR] %s", command))
-			debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, fmt.Sprintf("out: %s", outb.String()))
-			debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, fmt.Sprintf("err: %s", errb.String()))
-			debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, err.Error())
+			debugMessage(DEBUG_SHOW_CHAOS_MESSAGE, fmt.Sprintf("[ERROR] %s", command))
+			debugMessage(DEBUG_SHOW_CHAOS_MESSAGE, fmt.Sprintf("out: %s", outb.String()))
+			debugMessage(DEBUG_SHOW_CHAOS_MESSAGE, fmt.Sprintf("err: %s", errb.String()))
+			debugMessage(DEBUG_SHOW_CHAOS_MESSAGE, err.Error())
 		} else {
 			if outb.Available() > 0 {
 				buf := outb.String()
 				if len(buf) > 0 && buf != "<nil>" {
-					debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, buf)
+					debugMessage(DEBUG_SHOW_CHAOS_MESSAGE, buf)
 				}
 			}
 		}
@@ -591,22 +695,21 @@ func cleanWireguard(subJobSequence int, workerNum int, wgJob WireguardJob, route
 
 }
 
-func healthCheck(subJobSequence int, workerNum int, wgJob WireguardJob) error {
+func healthCheck(subJobSequence int, workerNum int, wgJob WireguardJob) *HealthCheckResult {
 
 	switch AppConfig.HealthCheckMethod {
 	case HCMethodICMP:
-		err := healthCheckICMP(subJobSequence, workerNum, wgJob)
-		return err
+		return healthCheckICMP(subJobSequence, workerNum, wgJob)
 	case HCMethodDNS:
-		return errors.New("Not implemented")
+		return healthCheckDNS(subJobSequence, workerNum, wgJob)
 	case HCMethodTCP:
-		return errors.New("Not implemented")
+		return healthCheckTCP(subJobSequence, workerNum, wgJob)
 	case HCMethodHTTP:
-		return errors.New("Not implemented")
+		return healthCheckHTTP(subJobSequence, workerNum, wgJob)
 	default:
-		return errors.New("Unknown Health Check Method")
+		return &HealthCheckResult{Error: errors.New("Not implemented healthcheck method")}
 	}
-	return nil
+
 }
 
 type WireguardProfileListRaw map[string]string // profile id = b64
@@ -621,12 +724,7 @@ const (
 
 func main() {
 
-	AppConfig.HealthCheckMethod = HCMethodICMP
-	AppConfig.HealthCheckEndpoint = "1.0.0.1"
-	AppConfig.HealthCheckRetries = 3
-	AppConfig.HealthCheckInterval = 3 * time.Second
-	AppConfig.RunTimeout = 30 * time.Second
-	AppConfig.WorkerCount = 128
+	initConfig()
 
 	profileList, err := loadProfile()
 	if err != nil {
@@ -640,29 +738,59 @@ func main() {
 
 	go startWorker(chJobResult, profileList)
 
-	debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, "end")
+	timeoutContext, _ := context.WithTimeout(context.Background(), AppConfig.RunTimeout)
 
-	for i := 0; i < len(profileList); i++ {
-		debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, fmt.Sprintf("Waiting i=%d chan", i))
-		r := <-chJobResult
-
-		if r.Error == nil {
-			JobResultStatus[r.ProfileID] = ErrorSuccessResult{
-				Success:      "ok",
-				ErrorMessage: "success",
-			}
-		} else {
-			JobResultStatus[r.ProfileID] = ErrorSuccessResult{
-				Success:      "error",
-				ErrorMessage: r.Error.Error(),
-			}
-		}
-	}
-
+	// Print Result
 	var resultMessage ResultMessage
 
 	resultMessage.Status = "ok"
 	resultMessage.Message = "Hello, world!"
+	resultMessage.DesiredCheckCount = len(profileList)
+
+Collect:
+
+	for i := 0; i < resultMessage.DesiredCheckCount; i++ {
+		debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, fmt.Sprintf("Waiting i=%d chan", i))
+
+		select {
+		case <-timeoutContext.Done():
+			var resultMessage ResultMessage
+
+			resultMessage.Status = "error"
+			resultMessage.Message = "runtimeout"
+
+			break Collect
+
+		case r := <-chJobResult:
+
+			if r.Error == nil {
+				JobResultStatus[r.ProfileID] = ErrorSuccessResult{
+					Success:      "ok",
+					ErrorMessage: r.SuccessMessage,
+				}
+				resultMessage.SucceedCount++
+			} else {
+				JobResultStatus[r.ProfileID] = ErrorSuccessResult{
+					Success:      "error",
+					ErrorMessage: r.Error.Error(),
+				}
+				resultMessage.ErrorCount++
+			}
+
+			resultMessage.ProceedCount++
+
+		}
+	}
+
+	if resultMessage.ProceedCount != resultMessage.DesiredCheckCount {
+		resultMessage.Status = "error"
+	}
+
+	if resultMessage.ErrorCount > 0 || resultMessage.ProceedCount == 0 {
+		resultMessage.Status = "error"
+	}
+
+	resultMessage.ActiveParallelWorkerCount = AppConfig.ActiveParallelWorkerCount
 
 	j, err := json.Marshal(JobResultStatus)
 	if err != nil {
@@ -677,6 +805,101 @@ func main() {
 	}
 
 	fmt.Println(string(r))
+
+	if resultMessage.Status == "error" {
+		os.Exit(1)
+	}
+
+}
+
+func initConfig() {
+
+	DebugLevel = DEBUG_SHOW_ERROR_MESSAGE
+	DebugLevel += DEBUG_SHOW_CRITICAL_MESSAGE
+	DebugLevel += DEBUG_SHOW_INFO_MESSAGE
+	DebugLevel += DEBUG_SHOW_DEBUG_MESSAGE
+
+	AppConfig.HealthCheckMethod = HCMethodICMP
+	AppConfig.HealthCheckEndpoint = "1.0.0.1"
+	AppConfig.HealthCheckTimeout = 3 * time.Second
+	AppConfig.HealthCheckInterval = 1 * time.Second
+	AppConfig.HealthCheckRunTimeout = 10 * time.Second
+	AppConfig.HealthCheckRetries = 3
+	AppConfig.RunTimeout = 30 * time.Second
+	AppConfig.WorkerCount = 8
+
+	if val := os.Getenv("HEALTHCHECK_METHOD"); val != "" {
+		AppConfig.HealthCheckMethod = val
+	}
+
+	if val := os.Getenv("HEALTHCHECK_ENDPOINT"); val != "" {
+		AppConfig.HealthCheckEndpoint = val
+	}
+
+	if val := os.Getenv("HEALTHCHECK_TIMEOUT"); val != "" {
+		i, err := strconv.Atoi(val)
+		if err != nil {
+			debugMessage(DEBUG_SHOW_CRITICAL_MESSAGE, fmt.Sprintf("HEALTHCHECK_TIMEOUT value error %s", val))
+		} else {
+			AppConfig.HealthCheckTimeout = time.Duration(i * int(time.Millisecond))
+		}
+	}
+
+	if val := os.Getenv("HEALTHCHECK_INTERVAL"); val != "" {
+		i, err := strconv.Atoi(val)
+		if err != nil {
+			debugMessage(DEBUG_SHOW_CRITICAL_MESSAGE, fmt.Sprintf("HEALTHCHECK_INTERVAL value error %s", val))
+		} else {
+			AppConfig.HealthCheckInterval = time.Duration(i * int(time.Millisecond))
+		}
+	}
+
+	if val := os.Getenv("HEALTHCHECK_RETRIES"); val != "" {
+		i, err := strconv.Atoi(val)
+		if err != nil {
+			debugMessage(DEBUG_SHOW_CRITICAL_MESSAGE, fmt.Sprintf("HEALTHCHECK_RETRIES value error %s", val))
+		} else {
+			AppConfig.HealthCheckRetries = i
+		}
+	}
+
+	if val := os.Getenv("HEALTHCHECK_RUNTIMEOUT"); val != "" {
+		i, err := strconv.Atoi(val)
+		if err != nil {
+			debugMessage(DEBUG_SHOW_CRITICAL_MESSAGE, fmt.Sprintf("HEALTHCHECK_RUNTIMEOUT value error %s", val))
+		} else {
+			AppConfig.HealthCheckRunTimeout = time.Duration(i * int(time.Millisecond))
+		}
+	}
+
+	if val := os.Getenv("RUNTIMEOUT"); val != "" {
+		i, err := strconv.Atoi(val)
+		if err != nil {
+			debugMessage(DEBUG_SHOW_CRITICAL_MESSAGE, fmt.Sprintf("RUNTIMEOUT value error %s", val))
+		} else {
+			AppConfig.RunTimeout = time.Duration(i * int(time.Millisecond))
+		}
+	}
+
+	if val := os.Getenv("WORKER"); val != "" {
+		i, err := strconv.Atoi(val)
+		if err != nil {
+			debugMessage(DEBUG_SHOW_CRITICAL_MESSAGE, fmt.Sprintf("WORKER value error %s", val))
+		} else {
+			AppConfig.WorkerCount = i
+		}
+	}
+
+	if val := os.Getenv("REMOTE_PROFILE_PATH"); val != "" {
+		AppConfig.RemoteProfilePath = val
+	}
+
+	if val := os.Getenv("DEBUG_LEVEL"); val != "" {
+		i, err := strconv.Atoi(val)
+		if err == nil && i > 0 {
+			DebugLevel = i
+		}
+	}
 
 }
 

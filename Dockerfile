@@ -20,9 +20,8 @@ COPY --from=wireguardgo /wgbuild/wireguard-go /bin/wireguard-go
 
 WORKDIR /app
 COPY go.mod go.sum /app
-RUN apk --no-cache --update add libcap iptables tcpdump iproute2 && go mod download
+RUN apk --no-cache --update add libcap iptables tcpdump iproute2 bind-tools && go mod download
 COPY *.go /app
-COPY ./dev/profile.json /app
 
 RUN CGO_ENABLED=0 GOOS=linux go build -o /wireguard-connectivity-test && \
     setcap cap_net_raw=+ep /wireguard-connectivity-test && \
