@@ -25,10 +25,10 @@ import (
 )
 
 const (
-	DEBUG_SHOW_ERROR_MESSAGE    = 1 << 1
-	DEBUG_SHOW_CRITICAL_MESSAGE = 1 << 2
-	DEBUG_SHOW_INFO_MESSAGE     = 1 << 3
-	DEBUG_SHOW_DEBUG_MESSAGE    = 1 << 4
+	DEBUG_SHOW_CRITICAL_MESSAGE = 0
+	DEBUG_SHOW_ERROR_MESSAGE    = 1 << 0
+	DEBUG_SHOW_INFO_MESSAGE     = 1 << 1
+	DEBUG_SHOW_DEBUG_MESSAGE    = 1 << 2
 	DEBUG_SHOW_CHAOS_MESSAGE    = 1 << 7
 
 	DEBUG_SHOW_WIREGUARD_MESSAGE  = 1 << 10
@@ -337,7 +337,7 @@ func startWorker(processCh chan JobResult, wireguardProfileList WireguardProfile
 
 	WorkerSetting1:
 
-		// full scan for find duplicate EndpointIP
+		// full scan to find duplicate EndpointIP
 		for k, _ := range WireguardWorkersJob {
 			if WireguardWorkersJob[k] != nil {
 
@@ -351,8 +351,12 @@ func startWorker(processCh chan JobResult, wireguardProfileList WireguardProfile
 			}
 		}
 
+		if assigned {
+			continue
+		}
+
 	WorkerSetting2:
-		// full scan for find duplicate InterfaceIP
+		// full scan to find duplicate InterfaceIP
 		for k, _ := range WireguardWorkersJob {
 			if WireguardWorkersJob[k] != nil {
 				workerJobList, ok := WireguardWorkersJob[k]

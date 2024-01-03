@@ -80,6 +80,7 @@ When the container image is started, user settings are made through environment 
 ### Wireguard Profile File
 
 - docker volume mount를 통해 `/profile.json`을 마운트해야합니다. `-v ./dev/profile.json:/profile.json`
+- ⚠️테스트시 사용할 Config는 별도의 실제 사용자가 있는 Peer Configuration이 되는 경우 **실제 사용자의 연결에 충돌이 발생합니다**. 테스트 전용의 Peer profile을 생성하여 연결성 테스트를 하세요.
 
 ```json
 {
@@ -120,6 +121,7 @@ When the container image is started, user settings are made through environment 
   - 테스트 응용프로그램이 종료될 시간입니다. 컨테이너가 시작되고 해당 시간이 경과되면 각 요청에 대한 응답 대기시간과 상관없이 응용프로그램이 종료됩니다. 
 - `REMOTE_PROFILE_PATH`: (Default) null
   - profile.json 파일을 외부의 웹사이트로부터 가져오려고 하는 경우 해당 환경변수에 URL을 지정합니다.
+- `PROFILE_DATA_SINGLE`: wg-quick 유틸리티에서 사용하는 Wireguard Configuration파일(`wg0.conf`)을 Base64로 Encoding한 것 입니다. 해당 환경변수는 `profile.json`를 마운트하고 싶지 않고 가볍게 바로 실행하고 싶은 경우에 사용합니다.
 
 #### Sample of Running with Docker
 
