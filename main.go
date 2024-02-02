@@ -4,464 +4,104 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/miekg/dns"
-	probing "github.com/prometheus-community/pro-bing"
 	"gopkg.in/ini.v1"
 )
 
-var WireguardInterface string = "wg0"
-var WireguardControlSocket string = fmt.Sprintf("/var/run/wireguard/%s.sock", WireguardInterface)
-var WireguardDaemonPID = 0
-
-var Debug = 0
-
 const (
-	HCMethodICMP = "icmp"
-	HCMethodDNS  = "dns"
-	HCMethodTCP  = "tcp"
-	HCMethodHTTP = "http"
+	DEBUG_SHOW_CRITICAL_MESSAGE = 0
+	DEBUG_SHOW_ERROR_MESSAGE    = 1 << 0
+	DEBUG_SHOW_INFO_MESSAGE     = 1 << 1
+	DEBUG_SHOW_DEBUG_MESSAGE    = 1 << 2
+	DEBUG_SHOW_CHAOS_MESSAGE    = 1 << 7
+
+	DEBUG_SHOW_WIREGUARD_MESSAGE  = 1 << 10
+	DEBUG_SHOW_STATISTICS_MESSAGE = 1 << 11
+	DEBUG_DO_NOT_STOP             = 1 << 31 // 4294967295
 )
 
-var ConfigEnv struct {
-	wgData       string
-	hcMethod     string
-	hcEndpoint   string
-	hcAllowedIPs string
-	hcRetries    uint
-	hcRunTimeout time.Duration
+// var DebugLevel = DEBUG_SHOW_WIREGUARD_MESSAGE + DEBUG_SHOW_DEBUG_MESSAGE + DEBUG_SHOW_STATISTICS_MESSAGE
+var DebugLevel int // DEBUG_LEVEL
 
-	retryInterval time.Duration
-	retries       uint
-
-	label string
-}
+var WireguardInterfacePrefix string = "wg_" // /var/run/wireguard/%s.sock"
+var WireguardProfileFilePath = "/profile.json"
+var WireguardProfileDirectoryPath = "/etc/wireguard"
 
 type ResultMessage struct {
+	Status                    string          `json:"status"`
+	Message                   string          `json:"message"`
+	DesiredCheckCount         int             `json:"total"`
+	ProceedCount              int             `json:"proceed"`
+	ErrorCount                int             `json:"proceederror"`
+	SucceedCount              int             `json:"succeed"`
+	ActiveParallelWorkerCount int             `json:"workers"`
+	Results                   json.RawMessage `json:"results"`
+}
+
+type JobResultMessage struct {
 	Result  string `json:"result"`
 	Message string `json:"message"`
 	Label   string `json:"label,omitempty"`
 }
 
-func tryCounts() {
-	ConfigEnv.retries++
+func debugMessage(logLevel int, s string) {
 
-	if ConfigEnv.retries > ConfigEnv.hcRetries {
-		printErrorWithMessage(errors.New("Retries exceeded"))
-	}
-
-}
-
-func debugMessage(s string) {
-	if Debug == 2 {
+	if DebugLevel&logLevel != logLevel {
 		return
 	}
+
 	now := time.Now()
-	fmt.Fprintf(os.Stderr, "[DEBUG] [%s] %s", now.Format("15:04:05.000"), s)
-	if s[len(s)-1] != '\n' {
-		fmt.Fprintf(os.Stderr, "\n")
-	}
-}
-
-func printSuccessWithMessage(s string) {
-
-	j := &ResultMessage{
-		Result:  "ok",
-		Message: s,
-	}
-
-	if ConfigEnv.label != "" {
-		j.Label = ConfigEnv.label
-	}
-
-	//u, err := json.MarshalIndent(j, "", "    ")
-	u, err := json.Marshal(j)
-	if err != nil {
-		printErrorWithMessage(err)
-	}
-
-	fmt.Println(string(u))
-
-	proc, err := os.FindProcess(WireguardDaemonPID)
-	if err == nil {
-		debugMessage(fmt.Sprintf("Killing wireguard process %d", WireguardDaemonPID))
-		proc.Kill()
-	}
-
-	os.Exit(0)
-}
-
-func printErrorWithMessage(err error) {
-
-	j := &ResultMessage{
-		Result:  "error",
-		Message: err.Error(),
-	}
-
-	if ConfigEnv.label != "" {
-		j.Label = ConfigEnv.label
-	}
-
-	//u, err := json.MarshalIndent(j, "", "    ")
-	u, err := json.Marshal(j)
-	if err != nil {
-		printErrorWithMessage(err)
-	}
-
-	fmt.Println(string(u))
-
-	proc, err := os.FindProcess(WireguardDaemonPID)
-	if err == nil {
-		debugMessage(fmt.Sprintf("Killing wireguard process %d", WireguardDaemonPID))
-		proc.Kill()
-	}
-
-	os.Exit(1)
+	//trimmed := strings.TrimSuffix(s, "\n")
+	trimmed := strings.Replace(s, "\n", "", -1)
+	fmt.Fprintf(os.Stderr, "[DEBUG] [%s] %s\n", now.Format("15:04:05.000"), trimmed)
 
 }
 
-func main() {
-
-	ConfigEnv.hcMethod = os.Getenv("HEALTH_CHECK_METHOD")
-	if ConfigEnv.hcMethod == "" {
-		debugMessage("HCMethod is not set")
-		ConfigEnv.hcMethod = "icmp"
-	}
-
-	ConfigEnv.hcEndpoint = os.Getenv("HEALTH_CHECK_ENDPOINT")
-	if ConfigEnv.hcEndpoint == "" {
-		debugMessage("Endpoint is not set")
-		ConfigEnv.hcEndpoint = "1.0.0.1"
-	}
-
-	ConfigEnv.hcAllowedIPs = os.Getenv("HEALTH_CHECK_ALLOWEDIPS")
-
-	i, err := strconv.Atoi(os.Getenv("RUN_TIMEOUT"))
-	if err != nil {
-		debugMessage("Timeout is not set")
-		ConfigEnv.hcRunTimeout = 20 * time.Second
-	} else {
-		ConfigEnv.hcRunTimeout = time.Duration(i) * time.Second
-	}
-
-	i, err = strconv.Atoi(os.Getenv("HEALTH_CHECK_RETRIES"))
-	if err != nil {
-		debugMessage("Retries is not set")
-		ConfigEnv.hcRetries = 5
-	} else {
-		ConfigEnv.hcRetries = uint(i)
-	}
-
-	ConfigEnv.retryInterval = time.Duration(int64(ConfigEnv.hcRunTimeout) / int64(ConfigEnv.hcRetries))
-
-	decodeArray, err := base64.StdEncoding.DecodeString(os.Getenv("WG_CONFIG_DATA"))
-	if err != nil {
-		printErrorWithMessage(err)
-	}
-
-	ConfigEnv.label = os.Getenv("LABEL")
-
-	if os.Getenv("DEBUG") != "" {
-		Debug = 2
-	}
-
-	ctx, _ := context.WithTimeout(context.Background(), ConfigEnv.hcRunTimeout)
-	var wg sync.WaitGroup
-	go handleRunTimeout(&wg, ctx)
-
-	ConfigEnv.wgData = string(decodeArray)
-
-	debugMessage("Running wireguard")
-	wireguardCh := make(chan bool, 0)
-
-	go func() {
-		cmd := exec.Command("/bin/wireguard-go", "-f", WireguardInterface)
-		cmd.Env = os.Environ()
-		cmd.Env = append(cmd.Env, "LOG_LEVEL=debug")
-		stdout, _ := cmd.StdoutPipe()
-		stderr, _ := cmd.StderrPipe()
-		cmd.Start()
-		WireguardDaemonPID = cmd.Process.Pid
-
-		stdoutScanner := bufio.NewScanner(stdout)
-		stderrScanner := bufio.NewScanner(stderr)
-		stdoutScanner.Split(bufio.ScanLines)
-		stderrScanner.Split(bufio.ScanLines)
-
-		text := ""
-
-		for {
-			scanOut := stdoutScanner.Scan()
-			scanErr := stderrScanner.Scan()
-
-			flag := false
-
-			if scanOut {
-				text += stdoutScanner.Text()
-				debugMessage(text)
-				flag = true
-			}
-
-			if scanErr {
-				debugMessage(stderrScanner.Text())
-				flag = true
-			}
-
-			if !flag {
-				break
-			}
-
-		}
-		cmd.Wait()
-		printErrorWithMessage(errors.New(fmt.Sprintf("Wireguard not working, %s", text)))
-
-	}()
-
-	debugMessage("Waiting for wireguard running up")
-
-	go func() {
-		// Check wireguard socket avaialble
-		retries := 0
-		for {
-			debugMessage(fmt.Sprintf("Waiting for wireguard running up [%d]", retries))
-			_, err := net.Dial("unix", WireguardControlSocket)
-			if err == nil {
-				wireguardCh <- true
-				break
-			}
-			time.Sleep(10 * time.Millisecond)
-			retries++
-		}
-	}()
-
-	<-wireguardCh
-
-	// Parse wireguard tools configuration
-	parseWireguardQuickConf()
-
-	// connect unix socket
-	debugMessage("Connect unix socket")
-	unixSock, err := net.Dial("unix", WireguardControlSocket)
-	if err != nil {
-		printErrorWithMessage(err)
-	}
-	setupWireguard(unixSock)
-
-	// time.Sleep(1 * time.Second)
-	UpdateResolver()
-
-	switch ConfigEnv.hcMethod {
-	case HCMethodICMP:
-		wg.Add(1)
-		go hcICMP(ctx)
-	case HCMethodDNS:
-		wg.Add(1)
-		go hcDNS(ctx)
-	case HCMethodTCP:
-		wg.Add(1)
-
-		if ConfigEnv.hcEndpoint == "1.0.0.1" {
-			ConfigEnv.hcEndpoint = "1.0.0.1:80"
-		}
-
-		go hcTCP(ctx)
-	case HCMethodHTTP:
-		wg.Add(1)
-
-		if ConfigEnv.hcEndpoint == "1.0.0.1" {
-			ConfigEnv.hcEndpoint = "http://1.0.0.1/cdn-cgi/trace"
-		}
-
-		go hcHTTP(ctx)
-	default:
-		printErrorWithMessage(errors.New("unknown health check method"))
-	}
-
-	wg.Wait()
-
+var AppConfig struct {
+	HealthCheckMethod         string        // HEALTHCHECK_METHOD
+	HealthCheckEndpoint       string        // HEALTHCHECK_ENDPOINT
+	HealthCheckTimeout        time.Duration // HEALTHCHECK_TIMEOUT -- Fixed in dns(2000ms) icmp(800ms)
+	HealthCheckInterval       time.Duration // HEALTHCHECK_INTERVAL
+	HealthCheckRetries        int           // HEALTHCHECK_RETRIES
+	HealthCheckRunTimeout     time.Duration // HEALTHCHECK_RUNTIMEOUT
+	RunTimeout                time.Duration // RUNTIMEOUT
+	WorkerCount               int           // WORKER
+	RemoteProfilePath         string        // REMOTE_PROFILE_PATH
+	ActiveParallelWorkerCount int
 }
 
-func handleRunTimeout(wg *sync.WaitGroup, ctx context.Context) {
+var WireguardWorkersJob map[int]WireguardJobList // key=worker num
 
-	for {
-		select {
-		case <-ctx.Done():
-			printErrorWithMessage(ctx.Err())
-			//return
-		}
-	}
-
+type WireguardJobList map[string][]WireguardJob // key=ipv4,
+type WireguardJob struct {
+	Profile WireguardQuickConf
 }
 
-func hcICMP(ctx context.Context) {
-
-	for {
-
-		tryCounts()
-
-		debugMessage("pinging")
-		// pinger, err := probing.NewPinger(ConfigEnv.hcEndpoint)
-		pinger, err := probing.NewPinger(ConfigEnv.hcEndpoint)
-		pinger.SetPrivileged(true)
-		if err != nil {
-			printErrorWithMessage(err)
-		}
-		pinger.Interval = 250 * time.Millisecond
-		pinger.Count = 3
-		pinger.Timeout = 600 * time.Millisecond
-
-		pinger.OnRecv = func(pkt *probing.Packet) {
-			printSuccessWithMessage(fmt.Sprintf("%d bytes from %s: icmp_seq=%d time=%v\n",
-				pkt.Nbytes, pkt.IPAddr, pkt.Seq, pkt.Rtt))
-		}
-
-		err = pinger.Run() // Blocks until finished.
-		if err != nil {
-			printErrorWithMessage(err)
-		}
-
-		stats := pinger.Statistics()
-		debugMessage(fmt.Sprintf("Addr: %s, Packet loss: %f\n", stats.Addr, stats.PacketLoss))
-
-		time.Sleep(min(ConfigEnv.retryInterval-pinger.Timeout, 1000*time.Millisecond))
-	}
-
-}
-
-func hcDNS(ctx context.Context) {
-
-	for {
-
-		tryCounts()
-		debugMessage("querying dns")
-
-		m1 := new(dns.Msg)
-		m1.Id = dns.Id()
-		m1.RecursionDesired = true
-		m1.Question = []dns.Question{
-			dns.Question{".", dns.TypeA, dns.ClassINET},
-		}
-
-		c := new(dns.Client)
-		// laddr := net.UDPAddr{
-		// 	IP: net.ParseIP(string(GetOutboundIP())),
-		// }
-		c.Dialer = &net.Dialer{
-			Timeout: 1500 * time.Millisecond,
-			// LocalAddr: &laddr,
-		}
-		_, rtt, err := c.Exchange(m1, fmt.Sprintf("%s:%d", ConfigEnv.hcEndpoint, 53))
-		if err != nil {
-			debugMessage(err.Error())
-			time.Sleep(min(ConfigEnv.retryInterval-1500*time.Millisecond, 1000*time.Millisecond))
-			continue
-		}
-
-		msec := rtt.Milliseconds()
-		printSuccessWithMessage(fmt.Sprintf("resolve successful, in %dms, to %s", msec, ConfigEnv.hcEndpoint))
-
-	}
-
-}
-
-func hcTCP(ctx context.Context) {
-	debugMessage("Checking tcp")
-
-	for {
-
-		tryCounts()
-
-		d := net.Dialer{
-			Timeout: 5 * time.Second,
-		}
-		conn, err := d.Dial("tcp", ConfigEnv.hcEndpoint)
-		if err != nil {
-			// handle error
-			if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
-				debugMessage(err.Error())
-
-				time.Sleep(min(ConfigEnv.retryInterval-5000*time.Millisecond, 1500*time.Millisecond))
-
-				continue
-			} else {
-				printErrorWithMessage(err)
-			}
-
-		}
-		conn.Close()
-
-		printSuccessWithMessage(fmt.Sprintf("Connection succeed [%s]", conn.RemoteAddr()))
-	}
-
-}
-
-func hcHTTP(ctx context.Context) {
-
-	for {
-
-		tryCounts()
-
-		//https://blog.cloudflare.com/the-complete-guide-to-golang-net-http-timeouts/
-		//https://gosamples.dev/context-deadline-exceeded/
-		client := http.Client{
-			Timeout: 5 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true,
-				},
-			},
-		}
-
-		parsedUrl, err := url.Parse(ConfigEnv.hcEndpoint)
-		if err != nil {
-			printErrorWithMessage(err)
-		}
-
-		req := http.Request{
-			Method: "GET",
-			URL:    parsedUrl,
-		}
-
-		resp, err := client.Do(&req)
-		if err != nil {
-			//debug.PrintStack()
-			if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
-				debugMessage(err.Error())
-				time.Sleep(min(ConfigEnv.retryInterval-5000*time.Millisecond, 1500*time.Millisecond))
-			} else {
-				printErrorWithMessage(err)
-			}
-		}
-
-		printSuccessWithMessage(fmt.Sprintf("The request url %s request successful [status code=%d]", parsedUrl.String(), resp.StatusCode))
-
-	}
-
-}
-
-var WireguardQuickConf struct {
-	Interface struct {
-		Address    string
-		DNS        string
-		DNSs       []string
-		PrivateKey string
+type WireguardQuickConf struct {
+	ProfileID       string // Not standrard
+	ProfileSequence int
+	Interface       struct {
+		Address           string
+		AddressCIDRPrefix uint8
+		DNS               string
+		DNSs              []string
+		PrivateKey        string
 	}
 	Peer struct {
 		AllowedIPs   string
@@ -474,128 +114,565 @@ var WireguardQuickConf struct {
 	}
 }
 
-func parseWireguardQuickConf() {
-	cfg, err := ini.Load([]byte(ConfigEnv.wgData))
-	if err != nil {
-		debugMessage(string(debug.Stack()))
-		printErrorWithMessage(err)
+type JobResult struct {
+	ProfileID      string
+	SuccessMessage string
+	Error          error
+}
+
+type ErrorSuccessResult struct {
+	Success      string `json:"status"`
+	ErrorMessage string `json:"message"`
+}
+
+var JobResultStatus map[string]ErrorSuccessResult
+
+var defaultGatewayAddress string
+
+func loadProfile() (WireguardProfileList, error) {
+
+	profileList := make(WireguardProfileList)
+	var rawList WireguardProfileListRaw
+
+	if AppConfig.RemoteProfilePath != "" {
+
+		debugMessage(DEBUG_SHOW_INFO_MESSAGE, fmt.Sprintf("Get profile from %s", AppConfig.RemoteProfilePath))
+
+		resp, err := http.Get(AppConfig.RemoteProfilePath)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return nil, errors.New("the response of profile request has not returned 200")
+		}
+
+		err = json.NewDecoder(resp.Body).Decode(&rawList)
+		if err != nil {
+			return nil, err
+		}
+
+	} else {
+
+		debugMessage(DEBUG_SHOW_INFO_MESSAGE, fmt.Sprintf("Try read from %s", WireguardProfileFilePath))
+		data, err := ioutil.ReadFile(WireguardProfileFilePath)
+		if err == nil {
+
+			err = json.Unmarshal(data, &rawList)
+			if err != nil {
+				return nil, err
+			}
+
+			debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, string(data))
+
+		} else {
+
+			rawList = make(WireguardProfileListRaw)
+
+			debugMessage(DEBUG_SHOW_INFO_MESSAGE, fmt.Sprintf("Try read from %s", WireguardProfileDirectoryPath))
+			readdir, err := ioutil.ReadDir(WireguardProfileDirectoryPath)
+			if err != nil {
+				debugMessage(DEBUG_SHOW_INFO_MESSAGE, fmt.Sprintf("Cannot read %s // %s", WireguardProfileFilePath, err.Error()))
+				return nil, err
+			}
+
+			for _, file := range readdir {
+
+				if !file.IsDir() && strings.HasSuffix(file.Name(), ".conf") {
+					profileId := strings.TrimSuffix(file.Name(), ".conf")
+					if profileId == "" {
+						return nil, errors.New("read .conf")
+					}
+
+					readData, err := ioutil.ReadFile(file.Name())
+					if err != nil {
+						debugMessage(DEBUG_SHOW_INFO_MESSAGE, fmt.Sprintf("Cannot read %s // %s", file.Name(), err.Error()))
+						continue
+					}
+
+					rawList[profileId] = base64.StdEncoding.EncodeToString(readData)
+
+				}
+
+			}
+
+			return nil, err
+		}
+
 	}
 
-	_, err = cfg.GetSection("Interface")
-	if err != nil {
-		printErrorWithMessage(errors.New("Not found interface conf"))
+	if len(rawList) == 0 {
+		return nil, errors.New("did not read any profile")
 	}
 
-	//sec.
+	seq := 1
 
-	WireguardQuickConf.Interface.Address = cfg.Section("Interface").Key("Address").String()
-	WireguardQuickConf.Interface.DNS = cfg.Section("Interface").Key("DNS").String()
+	for profileId, base64EncodedWireguardQuickProfile := range rawList {
 
-	WireguardQuickConf.Interface.DNSs = strings.Split(WireguardQuickConf.Interface.DNS, ",")
-	for i := range WireguardQuickConf.Interface.DNSs {
-		WireguardQuickConf.Interface.DNSs[i] = strings.TrimSpace(WireguardQuickConf.Interface.DNSs[i])
+		if len(profileId)+len(WireguardInterfacePrefix) > 15 {
+			panic(fmt.Sprintf("ifname [%s%s] is too long", profileId, WireguardInterfacePrefix))
+		}
+
+		decodeArray, err := base64.StdEncoding.DecodeString(base64EncodedWireguardQuickProfile)
+		if err != nil {
+			return nil, err
+		}
+
+		cfg, err := ini.Load([]byte(decodeArray))
+		if err != nil {
+			debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, string(debug.Stack()))
+			return nil, err
+		}
+
+		_, err = cfg.GetSection("Interface")
+		if err != nil {
+			return nil, err
+		}
+
+		var wgQuickConf WireguardQuickConf
+		wgQuickConf.ProfileID = profileId
+		wgQuickConf.ProfileSequence = seq
+		profileIPAddress := cfg.Section("Interface").Key("Address").String()
+
+		netIP, _, err := net.ParseCIDR(profileIPAddress)
+		if err == nil {
+			wgQuickConf.Interface.Address = netIP.String()
+		} else {
+			if netIP := net.ParseIP(profileIPAddress); netIP != nil {
+				wgQuickConf.Interface.Address = netIP.String()
+			} else {
+				panic(fmt.Sprintf("Profile [%s] IP address [%s] is invalid", profileId, profileIPAddress))
+			}
+		}
+
+		wgQuickConf.Interface.DNS = cfg.Section("Interface").Key("DNS").String()
+
+		wgQuickConf.Interface.DNSs = strings.Split(wgQuickConf.Interface.DNS, ",")
+		for i := range wgQuickConf.Interface.DNSs {
+			wgQuickConf.Interface.DNSs[i] = strings.TrimSpace(wgQuickConf.Interface.DNSs[i])
+		}
+		wgQuickConf.Interface.DNS = wgQuickConf.Interface.DNSs[0]
+
+		wgQuickConf.Interface.PrivateKey, err = convertWireguardQuickConfigurationKeyHexEncoding(cfg.Section("Interface").Key("PrivateKey").String())
+		if err != nil {
+			return nil, err
+		}
+
+		wgQuickConf.Peer.AllowedIPs = cfg.Section("Peer").Key("AllowedIPs").String()
+		// TODO: AllowedIPs no defualt route
+		wgQuickConf.Peer.AllowedIPss = strings.Split(wgQuickConf.Peer.AllowedIPs, ",")
+		for i := range wgQuickConf.Peer.AllowedIPss {
+			wgQuickConf.Peer.AllowedIPss[i] = strings.TrimSpace(wgQuickConf.Peer.AllowedIPss[i])
+		}
+		wgQuickConf.Peer.AllowedIPs = wgQuickConf.Peer.AllowedIPss[0]
+
+		wgQuickConf.Peer.Endpoint = cfg.Section("Peer").Key("Endpoint").String()
+
+		splitEndpoint := strings.Split(wgQuickConf.Peer.Endpoint, ":")
+		wgQuickConf.Peer.EndpointIP = splitEndpoint[0]
+		wgQuickConf.Peer.EndpointPort = splitEndpoint[1]
+
+		wgQuickConf.Peer.PublicKey, err = convertWireguardQuickConfigurationKeyHexEncoding(cfg.Section("Peer").Key("PublicKey").String())
+		if err != nil {
+			return nil, err
+		}
+
+		profileList[profileId] = wgQuickConf
+		seq++
+
 	}
 
-	WireguardQuickConf.Interface.PrivateKey = convertWireguardQuickConfigurationKeyHexEncoding(cfg.Section("Interface").Key("PrivateKey").String())
+	// Check that there are duplicate wireguard interface ip addresses? Duplicated client ips are not supported
+	visitedInterfaceIPAddress := make(map[string]bool)
+	for _, v := range profileList {
+		if _, ok := visitedInterfaceIPAddress[v.Interface.Address]; ok {
+			// var resultMessage ResultMessage
+			// resultMessage.Status = "error"
+			// resultMessage.Message = fmt.Sprintf("Conflicts Interface Address = %s", v.Interface.Address)
+			// j, err := json.Marshal(resultMessage)
+			// if err != nil {
+			// 	debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, err.Error())
+			// } else {
+			// 	fmt.Println(string(j))
+			// }
+			// os.Exit(1)
+			debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, fmt.Sprintf("Conflicts Interface Address = %s", v.Interface.Address))
+		} else {
+			visitedInterfaceIPAddress[v.Interface.Address] = true
+		}
+	}
 
-	WireguardQuickConf.Peer.AllowedIPs = cfg.Section("Peer").Key("AllowedIPs").String()
-	// TODO: AllowedIPs no defualt route
-
-	WireguardQuickConf.Peer.Endpoint = cfg.Section("Peer").Key("Endpoint").String()
-
-	splitEndpoint := strings.Split(WireguardQuickConf.Peer.Endpoint, ":")
-	WireguardQuickConf.Peer.EndpointIP = splitEndpoint[0]
-	WireguardQuickConf.Peer.EndpointPort = splitEndpoint[1]
-
-	WireguardQuickConf.Peer.PublicKey = convertWireguardQuickConfigurationKeyHexEncoding(cfg.Section("Peer").Key("PublicKey").String())
+	return profileList, nil
 
 }
 
-func convertWireguardQuickConfigurationKeyHexEncoding(s string) string {
+func convertWireguardQuickConfigurationKeyHexEncoding(s string) (string, error) {
 
 	decodeKey, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
-		printErrorWithMessage(errors.New("b64 decode error" + err.Error()))
+		return "", err
 	}
 
 	hexString := hex.EncodeToString(decodeKey)
-	return hexString
+	return hexString, nil
 }
 
-func setupWireguard(sock net.Conn) {
+func startWorker(processCh chan JobResult, wireguardProfileList WireguardProfileList) {
 
-	wgSetupCommand := ""
-	wgSetupCommand += "set=1\n"
-	wgSetupCommand += fmt.Sprintf("private_key=%s\n", WireguardQuickConf.Interface.
-		PrivateKey)
-	wgSetupCommand += "fwmark=51820\n"
-	wgSetupCommand += fmt.Sprintf("public_key=%s\n", WireguardQuickConf.Peer.PublicKey)
-	wgSetupCommand += fmt.Sprintf("allowed_ip=%s\n", WireguardQuickConf.Peer.AllowedIPs)
-	wgSetupCommand += fmt.Sprintf("endpoint=%s\n", WireguardQuickConf.Peer.Endpoint)
+	debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, "Partitioning worker")
 
-	wgSetupCommand += "\n"
+	// Flattening
+	var profileList []WireguardQuickConf
+	for _, v := range wireguardProfileList {
+		profileList = append(profileList, v)
+	}
 
-	wgSetupCommand += "get=1\n"
+	// Partitioning and Job Signing
+	for i := 0; i < len(profileList); i++ {
 
-	go func() {
+		workerPartition := (i % AppConfig.WorkerCount) + 1
+		wireguardProfile := profileList[i]
 
-		recvData := make([]byte, 512)
-		n, err := sock.Read(recvData)
-		if n > 0 {
-			// do something with recvData[:n]
-			debugMessage(fmt.Sprintf("got data %s", recvData[:n]))
+		assigned := false
 
-			splitRows := strings.Split(string(recvData[:n]), "\n")
+	WorkerSetting1:
 
-			flag := false
-			for _, v := range splitRows {
-				if strings.HasPrefix(v, "errno=") {
-					if v != "errno=0" {
-						flag = true
+		// full scan to find duplicate EndpointIP
+		for k, _ := range WireguardWorkersJob {
+			if WireguardWorkersJob[k] != nil {
+
+				if _, ok := WireguardWorkersJob[k][wireguardProfile.Peer.EndpointIP]; ok {
+					debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, fmt.Sprintf("Duplicated endpoint ip [%s] detected.\n", wireguardProfile.Peer.EndpointIP))
+					WireguardWorkersJob[k][wireguardProfile.Peer.EndpointIP] = append(WireguardWorkersJob[k][wireguardProfile.Peer.EndpointIP], WireguardJob{Profile: wireguardProfile})
+					debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, fmt.Sprintf("Assigned Profile [%s] to Worker[%d]\n", wireguardProfile.ProfileID, k))
+					assigned = true
+					break WorkerSetting1
+				}
+			}
+		}
+
+		if assigned {
+			continue
+		}
+
+	WorkerSetting2:
+		// full scan to find duplicate InterfaceIP
+		for k, _ := range WireguardWorkersJob {
+			if WireguardWorkersJob[k] != nil {
+				workerJobList, ok := WireguardWorkersJob[k]
+				if ok {
+					for _, jobList := range workerJobList {
+						for _, job := range jobList {
+							if job.Profile.Interface.Address == wireguardProfile.Interface.Address {
+								debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, fmt.Sprintf("Conflicts interface ip [%s]\n", wireguardProfile.Interface.Address))
+								WireguardWorkersJob[k][wireguardProfile.Peer.EndpointIP] = append(WireguardWorkersJob[k][wireguardProfile.Peer.EndpointIP], WireguardJob{Profile: wireguardProfile})
+								debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, fmt.Sprintf("Assigned Profile [%s] to Worker[%d]\n", wireguardProfile.ProfileID, k))
+								assigned = true
+								break WorkerSetting2
+							}
+						}
 					}
 				}
 			}
+		}
 
-			if flag {
-				printErrorWithMessage(errors.New("wireguard got err"))
+		if assigned {
+			continue
+		}
+
+		if WireguardWorkersJob[workerPartition] == nil {
+			WireguardWorkersJob[workerPartition] = make(WireguardJobList)
+		}
+
+		WireguardWorkersJob[workerPartition][wireguardProfile.Peer.EndpointIP] = append(WireguardWorkersJob[workerPartition][wireguardProfile.Peer.EndpointIP], WireguardJob{Profile: wireguardProfile})
+
+		debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, fmt.Sprintf("Assigned Profile [%s] to Worker[%d]\n", wireguardProfile.ProfileID, workerPartition))
+
+	}
+
+	// start
+	wg := &sync.WaitGroup{}
+	for workerNum, _ := range WireguardWorkersJob {
+
+		workerJobList, ok := WireguardWorkersJob[workerNum]
+		if !ok {
+			continue
+		}
+
+		if len(workerJobList) == 0 {
+			continue
+		}
+
+		debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, fmt.Sprintf("Start Worker #%d", workerNum))
+		wg.Add(1)
+		AppConfig.ActiveParallelWorkerCount++
+		go workerRun(wg, workerNum, processCh, workerJobList)
+
+	}
+	wg.Wait()
+
+	return
+
+}
+
+func workerRun(wg *sync.WaitGroup, workerNum int, processCh chan JobResult, wgJobList WireguardJobList) {
+	defer wg.Done()
+	debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, fmt.Sprintf("Running wireguard worker#%d", workerNum))
+
+	for endpointIPAddress, _ := range wgJobList {
+
+		for i, subJob := range wgJobList[endpointIPAddress] {
+			debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, fmt.Sprintf("Run wireguard profile [%s]", subJob.Profile.ProfileID))
+
+			var rtId int
+
+			pid, err := wireguard(i, workerNum, subJob, &rtId)
+			if DebugLevel&DEBUG_DO_NOT_STOP == DEBUG_DO_NOT_STOP {
+				continue
+			}
+
+			if err != nil {
+				proc, errProcess := os.FindProcess(pid)
+				if errProcess == nil {
+					debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, fmt.Sprintf("killing wireguard %d", pid))
+					proc.Kill()
+				}
+
+				cleanWireguard(i, workerNum, subJob, &rtId)
+
+				processCh <- JobResult{
+					ProfileID: subJob.Profile.ProfileID,
+					Error:     err,
+				}
+
+				continue
+			}
+
+			hr := healthCheck(i, workerNum, subJob)
+			if hr.Error != nil {
+				debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, hr.Error.Error())
+			}
+
+			proc, errProcess := os.FindProcess(pid)
+			if errProcess == nil {
+				debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, fmt.Sprintf("killing wireguard %d", pid))
+				proc.Kill()
+			}
+
+			cleanWireguard(i, workerNum, subJob, &rtId)
+
+			processCh <- JobResult{
+				ProfileID:      subJob.Profile.ProfileID,
+				SuccessMessage: hr.SuccessMessage,
+				Error:          hr.Error,
 			}
 
 		}
-		if e, ok := err.(interface{ Timeout() bool }); ok && e.Timeout() {
-			// handle timeout
-			debugMessage("sock timeout")
-		} else if err != nil {
-			// handle error
-			debugMessage("sock error")
+
+	}
+
+	debugMessage(DEBUG_SHOW_INFO_MESSAGE, fmt.Sprintf("Worker#%d has done", workerNum))
+
+}
+
+func wireguard(subJobSequence int, workerNum int, wgJob WireguardJob, routerTableId *int) (pid int, err error) {
+	wireguardCh := make(chan error)
+	wireguardSock := make(chan net.Conn)
+
+	wireguardInterfaceName := fmt.Sprintf("%s%s", WireguardInterfacePrefix, wgJob.Profile.ProfileID)
+
+	go func() {
+		cmd := exec.Command("/bin/wireguard-go", "-f", wireguardInterfaceName)
+		cmd.Env = os.Environ()
+		cmd.Env = append(cmd.Env, "LOG_LEVEL=debug")
+		stdout, _ := cmd.StdoutPipe()
+		stderr, _ := cmd.StderrPipe()
+		cmd.Start()
+		pid = cmd.Process.Pid
+
+		stdoutScanner := bufio.NewScanner(stdout)
+		stderrScanner := bufio.NewScanner(stderr)
+		stdoutScanner.Split(bufio.ScanLines)
+		stderrScanner.Split(bufio.ScanLines)
+
+		for {
+			scanOut := stdoutScanner.Scan()
+			scanErr := stderrScanner.Scan()
+
+			flag := false
+
+			if scanOut {
+				debugMessage(DEBUG_SHOW_WIREGUARD_MESSAGE, stdoutScanner.Text())
+				flag = true
+			}
+
+			if scanErr {
+				debugMessage(DEBUG_SHOW_WIREGUARD_MESSAGE, stderrScanner.Text())
+				flag = true
+			}
+
+			if !flag {
+				break
+			}
+
+		}
+		err := cmd.Wait()
+		if err != nil {
+			debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, err.Error())
 		}
 
 	}()
 
-	debugMessage(wgSetupCommand)
-	n, err := sock.Write([]byte(wgSetupCommand))
+	debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, "Waiting for wireguard running up")
+
+	go func() {
+		// Check wireguard socket avaialble
+
+		ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
+	Timeout:
+		for {
+			select {
+			case <-ctx.Done():
+				debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, "Timeout!!!!!!!!!!!!!")
+				wireguardCh <- errors.New("context timeout")
+				break Timeout
+			default:
+				conn, err := net.Dial("unix", fmt.Sprintf("/var/run/wireguard/%s.sock", wireguardInterfaceName))
+				if err == nil {
+					wireguardCh <- nil
+					wireguardSock <- conn
+					break Timeout
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+
+		}
+	}()
+
+	err = <-wireguardCh
 	if err != nil {
-		printErrorWithMessage(err)
+		return
+	}
+	sock := <-wireguardSock
+	debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, "wireguard is setting up now")
+	// Setup Wireguard
+	wgSetupCommand := ""
+	wgSetupCommand += "set=1\n"
+	wgSetupCommand += fmt.Sprintf("private_key=%s\n", wgJob.Profile.Interface.PrivateKey)
+	wgSetupCommand += fmt.Sprintf("fwmark=%d\n", wgJob.Profile.ProfileSequence)
+	wgSetupCommand += fmt.Sprintf("public_key=%s\n", wgJob.Profile.Peer.PublicKey)
+	wgSetupCommand += fmt.Sprintf("allowed_ip=%s\n", wgJob.Profile.Peer.AllowedIPs)
+	wgSetupCommand += fmt.Sprintf("endpoint=%s\n", wgJob.Profile.Peer.Endpoint)
+	wgSetupCommand += "\n"
+	wgSetupCommand += "get=1\n"
+
+	_, err = sock.Write([]byte(wgSetupCommand))
+	if err != nil {
+		debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, err.Error())
+		return
 	}
 
-	debugMessage(fmt.Sprintf("Write unix socket: %d bytes", n))
+	recvData := make([]byte, 512)
+	n, err := sock.Read(recvData)
+	if n > 0 {
+		// do something with recvData[:n]
+		debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, fmt.Sprintf("got data %s", recvData[:n]))
 
-	// gatherIPAddress := GetOutboundIP()
-	gatherDefaultGatewayAddress := GetDefaultGateway()
-	debugMessage(fmt.Sprintf("Default Gateway: %s", gatherDefaultGatewayAddress))
+		splitRows := strings.Split(string(recvData[:n]), "\n")
+
+		flag := false
+		for _, v := range splitRows {
+			if strings.HasPrefix(v, "errno=") {
+				if v != "errno=0" {
+					flag = true
+				}
+			}
+		}
+
+		if flag {
+			err = errors.New("wireguard got error")
+			return
+		}
+
+	}
+	if e, ok := err.(interface{ Timeout() bool }); ok && e.Timeout() {
+		// handle timeout
+		debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, "sock timeout")
+		return
+	} else if err != nil {
+		debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, "sock error")
+		return
+	}
+
+	debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, "ok")
+
+	// Tunnel Setup
 
 	var intSetupCommand []string
+	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip addr add %s/32 dev %s", wgJob.Profile.Interface.Address, wireguardInterfaceName))
+	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip link set %s up", wireguardInterfaceName))
 
-	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip addr add %s dev %s", WireguardQuickConf.Interface.Address, WireguardInterface))
-	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip link set %s up", WireguardInterface))
+	if subJobSequence == 0 {
+		intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip route add %s/32 via %s metric 1", wgJob.Profile.Peer.EndpointIP, defaultGatewayAddress))
+		// intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip route add %s via %s metric 1", wgJob.Profile.Peer.EndpointIP, defaultGatewayAddress))
+	}
 
-	intSetupCommand = append(intSetupCommand, "ip route")
-	intSetupCommand = append(intSetupCommand, "ip route delete default")
-	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip route add %s/32 via %s metric 1", WireguardQuickConf.Peer.EndpointIP, gatherDefaultGatewayAddress))
-	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip route replace default via %s dev %s metric 2", WireguardQuickConf.Interface.Address, WireguardInterface))
+	*routerTableId = (wgJob.Profile.ProfileSequence + 1000)
+
+	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip route add default via %s dev %s table %d", wgJob.Profile.Interface.Address, wireguardInterfaceName, (*routerTableId)))
+	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip rule add from %s/32 table %d", wgJob.Profile.Interface.Address, (*routerTableId)))
 
 	for _, command := range intSetupCommand {
 
-		debugMessage(command)
+		debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, command)
+
+		commandSplit := strings.Split(command, " ")
+		commandPath := commandSplit[0]
+		commandArgs := commandSplit[1:]
+
+		cmd := exec.Command(commandPath, commandArgs...)
+		var outb, errb bytes.Buffer
+		cmd.Stdout = &outb
+		cmd.Stderr = &errb
+		if err = cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "out: %s", outb.String())
+			fmt.Fprintf(os.Stderr, "err: %s", errb.String())
+			debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, err.Error())
+			return
+		} else {
+			if outb.Available() > 0 {
+				buf := outb.String()
+				if len(buf) > 0 && buf != "<nil>" {
+					debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, buf)
+				}
+			}
+		}
+	}
+
+	return
+
+}
+
+// shit
+func cleanWireguard(subJobSequence int, workerNum int, wgJob WireguardJob, routerTableId *int) {
+
+	var intSetupCommand []string
+
+	wireguardInterfaceName := fmt.Sprintf("%s%s", WireguardInterfacePrefix, wgJob.Profile.ProfileID)
+
+	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip addr delete %s/32 dev %s", wgJob.Profile.Interface.Address, wireguardInterfaceName))
+	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip link delete %s", wireguardInterfaceName))
+
+	intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip route add %s/32 via %s metric 1", wgJob.Profile.Peer.EndpointIP, defaultGatewayAddress))
+
+	if routerTableId != nil {
+		intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip route delete default via %s dev %s table %d", wgJob.Profile.Interface.Address, wireguardInterfaceName, (*routerTableId)))
+		intSetupCommand = append(intSetupCommand, fmt.Sprintf("ip rule delete from %s/32 table %d", wgJob.Profile.Interface.Address, (*routerTableId)))
+	}
+
+	for _, command := range intSetupCommand {
+
+		debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, command)
 
 		commandSplit := strings.Split(command, " ")
 		commandPath := commandSplit[0]
@@ -606,104 +683,233 @@ func setupWireguard(sock net.Conn) {
 		cmd.Stdout = &outb
 		cmd.Stderr = &errb
 		if err := cmd.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "out: %s", outb.String())
-			fmt.Fprintf(os.Stderr, "err: %s", errb.String())
-			printErrorWithMessage(err)
+			debugMessage(DEBUG_SHOW_CHAOS_MESSAGE, fmt.Sprintf("[ERROR] %s", command))
+			debugMessage(DEBUG_SHOW_CHAOS_MESSAGE, fmt.Sprintf("out: %s", outb.String()))
+			debugMessage(DEBUG_SHOW_CHAOS_MESSAGE, fmt.Sprintf("err: %s", errb.String()))
+			debugMessage(DEBUG_SHOW_CHAOS_MESSAGE, err.Error())
 		} else {
 			if outb.Available() > 0 {
 				buf := outb.String()
 				if len(buf) > 0 && buf != "<nil>" {
-					debugMessage(buf)
+					debugMessage(DEBUG_SHOW_CHAOS_MESSAGE, buf)
 				}
 			}
 		}
-
 	}
 
 }
 
-// https://stackoverflow.com/questions/23558425/how-do-i-get-the-local-ip-address-in-go
-func GetOutboundIP() net.IP {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		printErrorWithMessage(err)
+func healthCheck(subJobSequence int, workerNum int, wgJob WireguardJob) *HealthCheckResult {
+
+	switch AppConfig.HealthCheckMethod {
+	case HCMethodICMP:
+		return healthCheckICMP(subJobSequence, workerNum, wgJob)
+	case HCMethodDNS:
+		return healthCheckDNS(subJobSequence, workerNum, wgJob)
+	case HCMethodTCP:
+		return healthCheckTCP(subJobSequence, workerNum, wgJob)
+	case HCMethodHTTP:
+		return healthCheckHTTP(subJobSequence, workerNum, wgJob)
+	default:
+		return &HealthCheckResult{Error: errors.New("Not implemented healthcheck method")}
 	}
-	defer conn.Close()
 
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-
-	return localAddr.IP
 }
 
-func GetDefaultGateway() string {
+type WireguardProfileListRaw map[string]string // profile id = b64
+type WireguardProfileList map[string]WireguardQuickConf
 
-	ip := ""
+const (
+	HCMethodICMP = "icmp"
+	HCMethodDNS  = "dns"
+	HCMethodTCP  = "tcp"
+	HCMethodHTTP = "http"
+)
 
-	file, err := os.Open("/proc/net/route")
+func main() {
+
+	initConfig()
+
+	profileList, err := loadProfile()
 	if err != nil {
-		printErrorWithMessage(err)
+		debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, err.Error())
+		os.Exit(1)
 	}
-	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
+	debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, fmt.Sprintf("Load %d Profile\n", len(profileList)))
 
-		// jump to line containing the agteway address
-		for i := 0; i < 1; i++ {
-			scanner.Scan()
+	chJobResult := make(chan JobResult)
+
+	go startWorker(chJobResult, profileList)
+
+	timeoutContext, _ := context.WithTimeout(context.Background(), AppConfig.RunTimeout)
+
+	// Print Result
+	var resultMessage ResultMessage
+
+	resultMessage.Status = "ok"
+	resultMessage.Message = "Hello, world!"
+	resultMessage.DesiredCheckCount = len(profileList)
+
+Collect:
+
+	for i := 0; i < resultMessage.DesiredCheckCount; i++ {
+		debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, fmt.Sprintf("Waiting i=%d chan", i))
+
+		select {
+		case <-timeoutContext.Done():
+			var resultMessage ResultMessage
+
+			resultMessage.Status = "error"
+			resultMessage.Message = "runtimeout"
+
+			break Collect
+
+		case r := <-chJobResult:
+
+			if r.Error == nil {
+				JobResultStatus[r.ProfileID] = ErrorSuccessResult{
+					Success:      "ok",
+					ErrorMessage: r.SuccessMessage,
+				}
+				resultMessage.SucceedCount++
+			} else {
+				JobResultStatus[r.ProfileID] = ErrorSuccessResult{
+					Success:      "error",
+					ErrorMessage: r.Error.Error(),
+				}
+				resultMessage.ErrorCount++
+			}
+
+			resultMessage.ProceedCount++
+
 		}
-
-		// get field containing gateway address
-		tokens := strings.Split(scanner.Text(), "\t")
-
-		gatewayHex := "0x" + tokens[2]
-
-		// cast hex address to uint32
-		d, _ := strconv.ParseInt(gatewayHex, 0, 64)
-		d32 := uint32(d)
-
-		// make net.IP address from uint32
-		ipd32 := make(net.IP, 4)
-		binary.LittleEndian.PutUint32(ipd32, d32)
-
-		// format net.IP to dotted ipV4 string
-		ip = net.IP(ipd32).String()
-
-		// exit scanner
-		break
 	}
 
-	if ip == "" {
-		printErrorWithMessage(errors.New(fmt.Sprintf("Couldn't get default gateway")))
+	if resultMessage.ProceedCount != resultMessage.DesiredCheckCount {
+		resultMessage.Status = "error"
 	}
 
-	return ip
+	if resultMessage.ErrorCount > 0 || resultMessage.ProceedCount == 0 {
+		resultMessage.Status = "error"
+	}
+
+	resultMessage.ActiveParallelWorkerCount = AppConfig.ActiveParallelWorkerCount
+
+	j, err := json.Marshal(JobResultStatus)
+	if err != nil {
+		debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, err.Error())
+	}
+
+	resultMessage.Results = j
+
+	r, err := json.Marshal(resultMessage)
+	if err != nil {
+		debugMessage(DEBUG_SHOW_DEBUG_MESSAGE, err.Error())
+	}
+
+	fmt.Println(string(r))
+
+	if resultMessage.Status == "error" {
+		os.Exit(1)
+	}
+
 }
 
-func UpdateResolver() {
+func initConfig() {
 
-	debugMessage("Update /etc/resolv.conf")
+	DebugLevel = DEBUG_SHOW_ERROR_MESSAGE
+	DebugLevel += DEBUG_SHOW_CRITICAL_MESSAGE
+	DebugLevel += DEBUG_SHOW_INFO_MESSAGE
+	DebugLevel += DEBUG_SHOW_DEBUG_MESSAGE
 
-	resolvConf := ""
+	AppConfig.HealthCheckMethod = HCMethodICMP
+	AppConfig.HealthCheckEndpoint = "1.0.0.1"
+	AppConfig.HealthCheckTimeout = 3 * time.Second
+	AppConfig.HealthCheckInterval = 1 * time.Second
+	AppConfig.HealthCheckRunTimeout = 10 * time.Second
+	AppConfig.HealthCheckRetries = 3
+	AppConfig.RunTimeout = 30 * time.Second
+	AppConfig.WorkerCount = 8
 
-	for i, server := range WireguardQuickConf.Interface.DNSs {
+	if val := os.Getenv("HEALTHCHECK_METHOD"); val != "" {
+		AppConfig.HealthCheckMethod = val
+	}
 
-		if i >= 3 {
-			debugMessage(fmt.Sprintf("Too many dns servers!! skip %s", server))
-			continue
+	if val := os.Getenv("HEALTHCHECK_ENDPOINT"); val != "" {
+		AppConfig.HealthCheckEndpoint = val
+	}
+
+	if val := os.Getenv("HEALTHCHECK_TIMEOUT"); val != "" {
+		i, err := strconv.Atoi(val)
+		if err != nil {
+			debugMessage(DEBUG_SHOW_CRITICAL_MESSAGE, fmt.Sprintf("HEALTHCHECK_TIMEOUT value error %s", val))
+		} else {
+			AppConfig.HealthCheckTimeout = time.Duration(i * int(time.Millisecond))
 		}
-
-		resolvConf += fmt.Sprintf("nameserver %s\n", server)
 	}
 
-	if resolvConf == "" {
-		debugMessage("Wireguard DNS is not set")
-		return
+	if val := os.Getenv("HEALTHCHECK_INTERVAL"); val != "" {
+		i, err := strconv.Atoi(val)
+		if err != nil {
+			debugMessage(DEBUG_SHOW_CRITICAL_MESSAGE, fmt.Sprintf("HEALTHCHECK_INTERVAL value error %s", val))
+		} else {
+			AppConfig.HealthCheckInterval = time.Duration(i * int(time.Millisecond))
+		}
 	}
 
-	err := os.WriteFile("/etc/resolv.conf", []byte(resolvConf), 0644)
-	if err != nil {
-		debugMessage("Failed to edit /etc/resolv.conf ^,^")
+	if val := os.Getenv("HEALTHCHECK_RETRIES"); val != "" {
+		i, err := strconv.Atoi(val)
+		if err != nil {
+			debugMessage(DEBUG_SHOW_CRITICAL_MESSAGE, fmt.Sprintf("HEALTHCHECK_RETRIES value error %s", val))
+		} else {
+			AppConfig.HealthCheckRetries = i
+		}
 	}
 
+	if val := os.Getenv("HEALTHCHECK_RUNTIMEOUT"); val != "" {
+		i, err := strconv.Atoi(val)
+		if err != nil {
+			debugMessage(DEBUG_SHOW_CRITICAL_MESSAGE, fmt.Sprintf("HEALTHCHECK_RUNTIMEOUT value error %s", val))
+		} else {
+			AppConfig.HealthCheckRunTimeout = time.Duration(i * int(time.Millisecond))
+		}
+	}
+
+	if val := os.Getenv("RUNTIMEOUT"); val != "" {
+		i, err := strconv.Atoi(val)
+		if err != nil {
+			debugMessage(DEBUG_SHOW_CRITICAL_MESSAGE, fmt.Sprintf("RUNTIMEOUT value error %s", val))
+		} else {
+			AppConfig.RunTimeout = time.Duration(i * int(time.Millisecond))
+		}
+	}
+
+	if val := os.Getenv("WORKER"); val != "" {
+		i, err := strconv.Atoi(val)
+		if err != nil {
+			debugMessage(DEBUG_SHOW_CRITICAL_MESSAGE, fmt.Sprintf("WORKER value error %s", val))
+		} else {
+			AppConfig.WorkerCount = i
+		}
+	}
+
+	if val := os.Getenv("REMOTE_PROFILE_PATH"); val != "" {
+		AppConfig.RemoteProfilePath = val
+	}
+
+	if val := os.Getenv("DEBUG_LEVEL"); val != "" {
+		i, err := strconv.Atoi(val)
+		if err == nil && i > 0 {
+			DebugLevel = i
+		}
+	}
+
+}
+
+func init() {
+	runtime.GOMAXPROCS(runtime.NumCPU())
+	WireguardWorkersJob = make(map[int]WireguardJobList)
+	JobResultStatus = make(map[string]ErrorSuccessResult)
+	defaultGatewayAddress = GetDefaultGateway()
 }

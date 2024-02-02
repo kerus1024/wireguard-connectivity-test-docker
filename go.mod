@@ -1,4 +1,4 @@
-module github.com/kerus1024/wireguard-connectivity-test
+module github.com/kerus1024/wireguard-connectivity-test2
 
 go 1.21
 
